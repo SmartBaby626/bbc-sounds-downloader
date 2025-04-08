@@ -8,7 +8,7 @@ import requests
 import subprocess
 import re
 
-from PyQt5.QtGui import QPixmap, QFont, QIcon
+from PyQt5.QtGui import QPixmap, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLineEdit,
     QPushButton, QListWidget, QTextEdit, QSplitter, QLabel, QListWidgetItem,
@@ -32,7 +32,6 @@ def resource_path(relative_path):
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
 
 class DescriptionFetcher(QThread):
@@ -97,19 +96,30 @@ class CoverImageFetcher(QThread):
             local_file = f"Error: {e}"
         self.coverFetched.emit(local_file)
 
+# --- Modified DownloadWorker ---
+# Now receives show_name and series_name and builds the output path accordingly.
 class DownloadWorker(QThread):
     progressChanged = pyqtSignal(int)
     downloadFinished = pyqtSignal(str, str)
-    def __init__(self, episode_url, download_location, download_quality):
+    def __init__(self, episode_url, download_location, download_quality, show_name, series_name):
         super().__init__()
         self.episode_url = episode_url
         self.download_location = download_location
         self.download_quality = download_quality
+        self.show_name = show_name
+        self.series_name = series_name
     def run(self):
         try:
-            cmd = ["yt-dlp", "--newline", "-o",
-                   os.path.join(self.download_location, "%(title)s.%(ext)s"),
-                   "-f", self.download_quality, self.episode_url]
+            # Build target directory: (download_location)/(show_name)/(series_name)
+            target_dir = os.path.join(self.download_location, self.show_name, self.series_name)
+            os.makedirs(target_dir, exist_ok=True)
+            # Use yt-dlp audio extraction options to convert to mp3.
+            cmd = [
+                "yt-dlp", "--newline",
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+                "-o", os.path.join(target_dir, "%(title)s.%(ext)s"),
+                "-f", self.download_quality, self.episode_url
+            ]
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True)
             for line in process.stdout:
@@ -125,6 +135,8 @@ class DownloadWorker(QThread):
         except Exception as e:
             self.downloadFinished.emit(f"Error: {str(e)}", self.episode_url)
 
+# --- Modified DownloadManager ---
+# Now the queue holds a tuple with (episode_url, show_name, series_name)
 class DownloadManager(QObject):
     progressChanged = pyqtSignal(int)
     downloadFinished = pyqtSignal(str, str)
@@ -133,17 +145,18 @@ class DownloadManager(QObject):
         super().__init__()
         self.download_location = download_location
         self.download_quality = download_quality
-        self.queue = []
+        self.queue = []  # list of tuples: (episode_url, show_name, series_name)
         self.current_worker = None
-    def addDownload(self, episode_url):
-        self.queue.append(episode_url)
+    def addDownload(self, episode_url, show_name, series_name):
+        self.queue.append((episode_url, show_name, series_name))
         self.queueUpdated.emit()
         if not self.current_worker:
             self.startNextDownload()
     def startNextDownload(self):
         if self.queue:
-            episode_url = self.queue.pop(0)
-            self.current_worker = DownloadWorker(episode_url, self.download_location, self.download_quality)
+            episode_url, show_name, series_name = self.queue.pop(0)
+            self.current_worker = DownloadWorker(episode_url, self.download_location,
+                                                 self.download_quality, show_name, series_name)
             self.current_worker.progressChanged.connect(self.progressChanged.emit)
             self.current_worker.downloadFinished.connect(self.onDownloadFinished)
             self.current_worker.start()
@@ -152,6 +165,10 @@ class DownloadManager(QObject):
         self.downloadFinished.emit(message, episode_url)
         self.current_worker = None
         self.startNextDownload()
+    def shutdown(self):
+        if self.current_worker and self.current_worker.isRunning():
+            self.current_worker.terminate()
+            self.current_worker.wait()
 
 class QueueItemWidget(QWidget):
     def __init__(self, episode_url, is_active=False):
@@ -203,7 +220,8 @@ class QueuePage(QWidget):
     def __init__(self, download_manager):
         super().__init__()
         self.download_manager = download_manager
-        self.queue_widgets = {}
+        self.active_widget = None
+        self.queue_widgets = []
         self.init_ui()
         self.download_manager.queueUpdated.connect(self.update_queue)
         self.download_manager.progressChanged.connect(self.update_active_progress)
@@ -225,34 +243,37 @@ class QueuePage(QWidget):
             widget = self.scroll_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
-        self.queue_widgets.clear()
+        self.active_widget = None
+        self.queue_widgets = []
         if self.download_manager.current_worker:
-            active_widget = QueueItemWidget(self.download_manager.current_worker.episode_url, is_active=True)
-            self.queue_widgets[self.download_manager.current_worker.episode_url] = active_widget
-            self.scroll_layout.addWidget(active_widget)
-        for url in self.download_manager.queue:
+            self.active_widget = QueueItemWidget(self.download_manager.current_worker.episode_url, is_active=True)
+            self.scroll_layout.addWidget(self.active_widget)
+        for tup in self.download_manager.queue:
+            url = tup[0]
             widget = QueueItemWidget(url, is_active=False)
-            self.queue_widgets[url] = widget
+            self.queue_widgets.append(widget)
             self.scroll_layout.addWidget(widget)
     def update_active_progress(self, percentage):
-        if self.download_manager.current_worker:
-            url = self.download_manager.current_worker.episode_url
-            if url in self.queue_widgets:
-                self.queue_widgets[url].setProgress(percentage)
+        if self.active_widget:
+            self.active_widget.setProgress(percentage)
 
+# --- Modified EpisodesWidget ---
+# Now also accepts show_title (from the search selection) and stores current_series_name on episode click.
 class EpisodesWidget(QWidget):
-    def __init__(self, show_url, main_window, download_manager):
+    def __init__(self, show_url, show_title, main_window, download_manager):
         super().__init__()
         self.show_url = show_url
+        self.show_title = show_title  # Store the show title for folder naming.
         self.main_window = main_window
         self.download_manager = download_manager
-        self.episodes_data = []
+        self.episodes_data = []  # Each entry: (series_name, episode_name, href)
         self.description_cache = {}
         self.cover_cache = {}
         self.fetcher = None
         self.cover_fetcher = None
         self._is_active = True
         self.current_episode_href = None
+        self.current_series_name = None  # To be set when an episode is selected.
         self.temp_dir = tempfile.mkdtemp(prefix="bbc_podcast_")
         self.init_ui()
         self.load_episodes()
@@ -332,6 +353,7 @@ class EpisodesWidget(QWidget):
         if index < len(self.episodes_data):
             series_name, episode_name, href = self.episodes_data[index]
             self.current_episode_href = href
+            self.current_series_name = series_name  # Save the series name for the output folder.
             info_html = (f"<b>Series:</b> {series_name}<br>"
                          f"<b>Episode:</b> {episode_name}<br>"
                          f"<b>URL:</b> <a href='{href}'>{href}</a><br><br>")
@@ -409,13 +431,20 @@ class EpisodesWidget(QWidget):
                      f"<b>URL:</b> <a href='{href}'>{href}</a>")
         self.info_text.setHtml(info_html)
     def download_episode(self):
-        if self.current_episode_href:
-            self.download_manager.addDownload(self.current_episode_href)
+        if self.current_episode_href and self.current_series_name:
+            # Pass the episode URL, along with the show title and series name, to the download manager.
+            self.download_manager.addDownload(self.current_episode_href, self.show_title, self.current_series_name)
             self.info_text.append("<br><i>Episode added to download queue.</i>")
     def closeEvent(self, event):
         self._is_active = False
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
+        if self.fetcher and self.fetcher.isRunning():
+            self.fetcher.terminate()
+            self.fetcher.wait()
+        if self.cover_fetcher and self.cover_fetcher.isRunning():
+            self.cover_fetcher.terminate()
+            self.cover_fetcher.wait()
         event.accept()
 
 class SearchWidget(QWidget):
@@ -520,7 +549,7 @@ class DownloadsPage(QWidget):
         self.update_downloads_list()
     def init_ui(self):
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Downloaded Episodes (mp4 only):"))
+        layout.addWidget(QLabel("Downloaded Episodes (mp3 only):"))
         self.downloads_list = QListWidget()
         layout.addWidget(self.downloads_list)
         self.current_progress = QProgressBar()
@@ -536,10 +565,11 @@ class DownloadsPage(QWidget):
         self.current_progress.setValue(0)
     def update_downloads_list(self):
         self.downloads_list.clear()
-        files = [f for f in os.listdir(self.download_manager.download_location)
-                 if f.lower().endswith(".mp4")]
-        for f in files:
-            self.downloads_list.addItem(f)
+        for root, dirs, files in os.walk(self.download_manager.download_location):
+            for f in files:
+                if f.lower().endswith(".mp3"):
+                    rel_dir = os.path.relpath(root, self.download_manager.download_location)
+                    self.downloads_list.addItem(os.path.join(rel_dir, f))
 
 class SettingsPage(QWidget):
     settingsChanged = pyqtSignal(str, str)
@@ -649,7 +679,8 @@ class SearchContainer(QWidget):
         self.search_widget.showSelected.connect(self.show_episodes)
         self.stack.addWidget(self.search_widget)
     def show_episodes(self, show_url, show_title, show_description):
-        self.episodes_widget = EpisodesWidget(show_url, self.main_window, self.download_manager)
+        # Pass show_title to EpisodesWidget
+        self.episodes_widget = EpisodesWidget(show_url, show_title, self.main_window, self.download_manager)
         self.stack.addWidget(self.episodes_widget)
         self.stack.setCurrentWidget(self.episodes_widget)
     def showSearch(self):
@@ -691,6 +722,9 @@ class MainWindow(QMainWindow):
         self.download_manager.download_quality = quality
     def show_search_page(self):
         self.search_container.showSearch()
+    def closeEvent(self, event):
+        self.download_manager.shutdown()
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
