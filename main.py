@@ -96,8 +96,7 @@ class CoverImageFetcher(QThread):
             local_file = f"Error: {e}"
         self.coverFetched.emit(local_file)
 
-# --- Modified DownloadWorker ---
-# Now receives show_name and series_name and builds the output path accordingly.
+
 class DownloadWorker(QThread):
     progressChanged = pyqtSignal(int)
     downloadFinished = pyqtSignal(str, str)
@@ -110,10 +109,10 @@ class DownloadWorker(QThread):
         self.series_name = series_name
     def run(self):
         try:
-            # Build target directory: (download_location)/(show_name)/(series_name)
+
             target_dir = os.path.join(self.download_location, self.show_name, self.series_name)
             os.makedirs(target_dir, exist_ok=True)
-            # Use yt-dlp audio extraction options to convert to mp3.
+
             cmd = [
                 "yt-dlp", "--newline",
                 "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
@@ -135,8 +134,7 @@ class DownloadWorker(QThread):
         except Exception as e:
             self.downloadFinished.emit(f"Error: {str(e)}", self.episode_url)
 
-# --- Modified DownloadManager ---
-# Now the queue holds a tuple with (episode_url, show_name, series_name)
+
 class DownloadManager(QObject):
     progressChanged = pyqtSignal(int)
     downloadFinished = pyqtSignal(str, str)
@@ -145,7 +143,7 @@ class DownloadManager(QObject):
         super().__init__()
         self.download_location = download_location
         self.download_quality = download_quality
-        self.queue = []  # list of tuples: (episode_url, show_name, series_name)
+        self.queue = [] 
         self.current_worker = None
     def addDownload(self, episode_url, show_name, series_name):
         self.queue.append((episode_url, show_name, series_name))
@@ -257,23 +255,23 @@ class QueuePage(QWidget):
         if self.active_widget:
             self.active_widget.setProgress(percentage)
 
-# --- Modified EpisodesWidget ---
-# Now also accepts show_title (from the search selection) and stores current_series_name on episode click.
+
+
 class EpisodesWidget(QWidget):
     def __init__(self, show_url, show_title, main_window, download_manager):
         super().__init__()
         self.show_url = show_url
-        self.show_title = show_title  # Store the show title for folder naming.
+        self.show_title = show_title  
         self.main_window = main_window
         self.download_manager = download_manager
-        self.episodes_data = []  # Each entry: (series_name, episode_name, href)
+        self.episodes_data = []  
         self.description_cache = {}
         self.cover_cache = {}
         self.fetcher = None
         self.cover_fetcher = None
         self._is_active = True
         self.current_episode_href = None
-        self.current_series_name = None  # To be set when an episode is selected.
+        self.current_series_name = None 
         self.temp_dir = tempfile.mkdtemp(prefix="bbc_podcast_")
         self.init_ui()
         self.load_episodes()
@@ -353,7 +351,7 @@ class EpisodesWidget(QWidget):
         if index < len(self.episodes_data):
             series_name, episode_name, href = self.episodes_data[index]
             self.current_episode_href = href
-            self.current_series_name = series_name  # Save the series name for the output folder.
+            self.current_series_name = series_name  
             info_html = (f"<b>Series:</b> {series_name}<br>"
                          f"<b>Episode:</b> {episode_name}<br>"
                          f"<b>URL:</b> <a href='{href}'>{href}</a><br><br>")
@@ -432,7 +430,6 @@ class EpisodesWidget(QWidget):
         self.info_text.setHtml(info_html)
     def download_episode(self):
         if self.current_episode_href and self.current_series_name:
-            # Pass the episode URL, along with the show title and series name, to the download manager.
             self.download_manager.addDownload(self.current_episode_href, self.show_title, self.current_series_name)
             self.info_text.append("<br><i>Episode added to download queue.</i>")
     def closeEvent(self, event):
